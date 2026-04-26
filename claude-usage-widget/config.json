@@ -1,0 +1,15 @@
+{
+  "plan": "pro",
+  "custom_session_limit": null,
+  "custom_weekly_limit": null,
+  "refresh_interval_seconds": 10,
+  "window_x": 100,
+  "window_y": 100,
+  "opacity": 0.92,
+  "always_on_top": true,
+  "alert_thresholds": [75, 90, 95],
+  "enable_audio_alerts": false,
+  "data_retention_days": 90,
+  "custom_data_path": null,
+  "theme": "dark"
+}
