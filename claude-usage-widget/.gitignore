@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.pyo
+usage_history.db
+*.db
+dist/
+build/
+*.spec.bak
