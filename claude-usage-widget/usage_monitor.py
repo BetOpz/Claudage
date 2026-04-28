@@ -1,7 +1,7 @@
 """
 usage_monitor.py - Read Claude Code JSONL files and calculate real-time usage metrics.
 
-Data source: ~/.claude/projects/**/*.jsonl  (Windows: %USERPROFILE%\.claude\projects)
+Data source: ~/.claude/projects/**/*.jsonl  (Windows: %USERPROFILE%/.claude/projects)
 Each line is a JSON record containing token usage for one Claude Code API call.
 """
 

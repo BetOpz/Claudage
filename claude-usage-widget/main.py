@@ -101,14 +101,15 @@ class ProgressBar(tk.Canvas):
     def __init__(self, parent, width=170, height=10, bar_bg="#2a2a4a", **kw):
         super().__init__(parent, width=width, height=height,
                          bg=bar_bg, highlightthickness=0, **kw)
-        self._w, self._h, self._bar_bg = width, height, bar_bg
+        # Use _pw/_ph to avoid clobbering tkinter's internal _w (widget path)
+        self._pw, self._ph, self._bar_bg = width, height, bar_bg
 
     def set_value(self, pct: float, color: str):
         self.delete("all")
-        self.create_rectangle(0, 0, self._w, self._h, fill=self._bar_bg, outline="")
-        fill_w = int(self._w * min(max(pct, 0), 100) / 100)
+        self.create_rectangle(0, 0, self._pw, self._ph, fill=self._bar_bg, outline="")
+        fill_w = int(self._pw * min(max(pct, 0), 100) / 100)
         if fill_w > 0:
-            self.create_rectangle(0, 0, fill_w, self._h, fill=color, outline="")
+            self.create_rectangle(0, 0, fill_w, self._ph, fill=color, outline="")
 
 # ── Main widget ───────────────────────────────────────────────────────────────
 class ClaudeUsageWidget:
