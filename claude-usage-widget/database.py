@@ -75,6 +75,24 @@ class UsageDatabase:
 
                 CREATE INDEX IF NOT EXISTS idx_snapshots_time
                     ON hourly_snapshots (snapshot_time);
+
+                CREATE TABLE IF NOT EXISTS multiplier_log (
+                    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                    logged_at           TEXT    NOT NULL,
+                    model               TEXT    NOT NULL DEFAULT '',
+                    session_tokens      INTEGER NOT NULL,
+                    tokens_delta        INTEGER NOT NULL,
+                    session_pct         REAL    NOT NULL,
+                    session_pct_delta   REAL    NOT NULL,
+                    session_multiplier  REAL    NOT NULL,
+                    weekly_tokens       INTEGER NOT NULL,
+                    weekly_pct          REAL    NOT NULL,
+                    weekly_pct_delta    REAL    NOT NULL,
+                    weekly_multiplier   REAL    NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_multiplier_log_time
+                    ON multiplier_log (logged_at);
             """)
 
     def _conn(self) -> sqlite3.Connection:
@@ -98,6 +116,40 @@ class UsageDatabase:
                 """,
                 (now.isoformat(), now.weekday(), now.hour, tokens, burn_rate),
             )
+
+    def save_multiplier(self, session_tokens: int, tokens_delta: int,
+                        session_pct: float, session_pct_delta: float, session_multiplier: float,
+                        weekly_tokens: int, weekly_pct: float,
+                        weekly_pct_delta: float, weekly_multiplier: float,
+                        model: str = ""):
+        """Log observed token-cost multipliers for both the 5hr and weekly windows."""
+        now = datetime.now(timezone.utc)
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO multiplier_log
+                    (logged_at, model, session_tokens, tokens_delta,
+                     session_pct, session_pct_delta, session_multiplier,
+                     weekly_tokens, weekly_pct, weekly_pct_delta, weekly_multiplier)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (now.isoformat(), model, session_tokens, tokens_delta,
+                 session_pct, session_pct_delta, session_multiplier,
+                 weekly_tokens, weekly_pct, weekly_pct_delta, weekly_multiplier),
+            )
+
+    def get_recent_multipliers(self, hours_back: int = 24) -> List[dict]:
+        """Return multiplier log entries from the last N hours, newest first."""
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM multiplier_log
+                WHERE logged_at >= datetime('now', ? || ' hours')
+                ORDER BY logged_at DESC
+                """,
+                (f"-{hours_back}",),
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     def save_session(self, record: SessionRecord) -> int:
         """Persist a completed session; returns the new row id."""

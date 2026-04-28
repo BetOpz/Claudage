@@ -1,7 +1,7 @@
 """
 usage_monitor.py - Read Claude Code JSONL files and calculate real-time usage metrics.
 
-Data source: ~/.claude/projects/**/*.jsonl  (Windows: %USERPROFILE%/.claude/projects)
+Data source: ~/.claude/projects/**/*.jsonl  (Windows: %USERPROFILE%\\.claude\\projects)
 Each line is a JSON record containing token usage for one Claude Code API call.
 """
 
@@ -19,9 +19,9 @@ logger = logging.getLogger(__name__)
 # ── Plan limits ──────────────────────────────────────────────────────────────
 # Tokens per 5-hour session block, sourced from reference monitor project.
 PLAN_SESSION_LIMITS = {
-    "pro":    19_000,
-    "max5":   88_000,
-    "max20":  220_000,
+    "pro":    44_000,
+    "max5":   220_000,
+    "max20":  880_000,
     "custom": 44_000,
 }
 
@@ -45,12 +45,7 @@ class UsageEntry:
 
     @property
     def total_tokens(self) -> int:
-        return (
-            self.input_tokens
-            + self.output_tokens
-            + self.cache_creation_tokens
-            + self.cache_read_tokens
-        )
+        return self.input_tokens + self.output_tokens
 
 
 @dataclass
@@ -199,6 +194,10 @@ def _parse_jsonl_file(filepath: Path, seen_ids: set) -> List[UsageEntry]:
                 except json.JSONDecodeError:
                     continue
 
+                # Only assistant records carry usage
+                if data.get("type") != "assistant":
+                    continue
+
                 ts = _parse_timestamp(
                     data.get("timestamp")
                     or data.get("created_at")
@@ -207,16 +206,15 @@ def _parse_jsonl_file(filepath: Path, seen_ids: set) -> List[UsageEntry]:
                 if ts is None:
                     continue
 
-                # Deduplication key (prefer explicit IDs, fall back to line hash)
+                msg = data.get("message") or {}
                 msg_id = (
-                    data.get("message_id")
+                    msg.get("id")
+                    or data.get("message_id")
                     or data.get("messageId")
-                    or (data.get("message") or {}).get("id", "")
-                    or data.get("request_id")
-                    or data.get("requestId")
                     or ""
                 )
-                dedup_key = msg_id or hashlib.md5(line.encode()).hexdigest()
+                request_id = data.get("requestId") or data.get("request_id") or ""
+                dedup_key = f"{msg_id}:{request_id}" if msg_id else hashlib.md5(line.encode()).hexdigest()
                 if dedup_key in seen_ids:
                     continue
                 seen_ids.add(dedup_key)
@@ -233,7 +231,7 @@ def _parse_jsonl_file(filepath: Path, seen_ids: set) -> List[UsageEntry]:
                 )
                 model = str(
                     data.get("model")
-                    or (data.get("message") or {}).get("model", "")
+                    or msg.get("model", "")
                     or ""
                 )
                 entries.append(UsageEntry(
@@ -245,7 +243,7 @@ def _parse_jsonl_file(filepath: Path, seen_ids: set) -> List[UsageEntry]:
                     cost_usd=cost,
                     model=model,
                     message_id=msg_id,
-                    request_id=data.get("request_id") or data.get("requestId") or "",
+                    request_id=request_id,
                 ))
     except Exception as e:
         logger.error("Error reading %s: %s", filepath, e)

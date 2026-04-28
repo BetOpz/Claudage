@@ -11,11 +11,13 @@ import queue
 import tkinter as tk
 from tkinter import filedialog
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from typing import Optional
 
 from usage_monitor import calculate_metrics, UsageMetrics, PLAN_SESSION_LIMITS
 from database import UsageDatabase
 from optimization import get_best_worst_times, get_current_slot_rank
+from claude_api import get_live_usage, save_session, load_session
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 LOG_DIR = Path.home() / ".claude-usage-widget"
@@ -39,7 +41,7 @@ DEFAULT_CONFIG = {
     "plan": "pro",
     "custom_session_limit": None,
     "custom_weekly_limit": None,
-    "refresh_interval_seconds": 10,
+    "refresh_interval_seconds": 60,
     "window_x": 100,
     "window_y": 100,
     "opacity": 0.92,
@@ -118,7 +120,12 @@ class ClaudeUsageWidget:
         self.db       = UsageDatabase(DB_PATH)
         self.metrics  = None
         self._alerted = set()
+        self._prev_session_tokens: Optional[int] = None
+        self._prev_session_pct: Optional[float] = None
+        self._prev_weekly_tokens: Optional[int] = None
+        self._prev_weekly_pct: Optional[float] = None
         self._opt_visible = False
+        self._collapsed = False
         self._drag_x = self._drag_y = 0
         self._queue  = queue.Queue()
 
@@ -176,9 +183,16 @@ class ClaudeUsageWidget:
         gear_lbl.pack(side=tk.RIGHT)
         gear_lbl.bind("<Button-1>", lambda e: self._open_settings())
 
+        self.collapse_lbl = tk.Label(self.title_bar, text="−", bg=self._t("border"),
+                                     fg=self._t("dim_fg"), font=("Segoe UI", 9),
+                                     padx=4, pady=4, cursor="hand2")
+        self.collapse_lbl.pack(side=tk.RIGHT)
+        self.collapse_lbl.bind("<Button-1>", lambda e: self._toggle_collapse())
+
         # Body
-        body = tk.Frame(self.root, bg=bg, padx=12, pady=8)
-        body.pack(fill=tk.BOTH, expand=True)
+        self.body = tk.Frame(self.root, bg=bg, padx=12, pady=8)
+        self.body.pack(fill=tk.BOTH, expand=True)
+        body = self.body
 
         # 5-hour row
         row5 = tk.Frame(body, bg=bg); row5.pack(fill=tk.X, pady=(0, 4))
@@ -283,6 +297,18 @@ class ClaudeUsageWidget:
     def _drag_move(self, e):
         self.root.geometry(f"+{e.x_root - self._drag_x}+{e.y_root - self._drag_y}")
 
+    def _toggle_collapse(self):
+        self._collapsed = not self._collapsed
+        if self._collapsed:
+            self.body.pack_forget()
+            self.opt_frame.pack_forget()
+            self.collapse_lbl.config(text="+")
+        else:
+            self.body.pack(fill=tk.BOTH, expand=True)
+            self.collapse_lbl.config(text="−")
+            if self._opt_visible:
+                self.opt_frame.pack(fill=tk.BOTH, expand=True)
+
     # ── Update loop ───────────────────────────────────────────────────────────
     def _schedule_update(self):
         interval_ms = int(self.config.get("refresh_interval_seconds", 10) * 1000)
@@ -304,6 +330,20 @@ class ClaudeUsageWidget:
             m = calculate_metrics(
                 sess_lim, week_lim, self.config.get("custom_data_path")
             )
+
+            # Overlay official percentages and reset times from claude.ai API
+            live = get_live_usage()
+            if live and not live.error:
+                m.session_pct = live.session_pct
+                m.weekly_pct  = live.weekly_pct
+                m.current_session_end = live.session_resets_at
+                # Recalculate ETA from official reset time
+                if live.session_resets_at:
+                    now = datetime.now(timezone.utc)
+                    remaining = (live.session_resets_at - now).total_seconds() / 60
+                    m.session_remaining_minutes = max(0, remaining)
+                m.error = None
+
             self._queue.put(m)
             self.root.after(0, self._apply_metrics)
 
@@ -315,9 +355,25 @@ class ClaudeUsageWidget:
         except queue.Empty:
             return
 
+        # Burn rate from JSONL inp+out over the last 15 minutes of actual calls.
+        # Idle time is naturally excluded — only real API activity counts.
+        now = datetime.now(timezone.utc)
+        if m.active_session:
+            cutoff = now - timedelta(minutes=15)
+            recent_entries = [
+                e for e in m.active_session.entries
+                if e.timestamp >= cutoff
+            ]
+            if recent_entries:
+                window_tokens = sum(e.input_tokens + e.output_tokens for e in recent_entries)
+                oldest = min(e.timestamp for e in recent_entries)
+                window_min = max((now - oldest).total_seconds() / 60, 1.0)
+                m.burn_rate_per_min = window_tokens / window_min
+
         self.metrics = m
         self._refresh_display(m)
         self._save_snapshot(m)
+        self._log_multiplier(m)
         self._check_alerts(m)
         if self._opt_visible:
             self._refresh_opt()
@@ -337,10 +393,10 @@ class ClaudeUsageWidget:
         else:
             self.lbl_burn.config(text="-- tok/min")
 
-        if m.session_remaining_minutes is not None and m.burn_rate_per_min > 0:
+        if m.session_remaining_minutes is not None:
             mins = int(m.session_remaining_minutes)
             eta = f"{mins // 60}h {mins % 60}m" if mins >= 60 else f"{mins}m"
-            self.lbl_eta.config(text=f"Session ~{eta}")
+            self.lbl_eta.config(text=f"Resets in {eta}")
         else:
             self.lbl_eta.config(text="--")
 
@@ -361,6 +417,68 @@ class ClaudeUsageWidget:
                 self.db.save_snapshot(m.session_tokens, m.burn_rate_per_min)
         except Exception as e:
             logger.error("snapshot save failed: %s", e)
+
+    def _log_multiplier(self, m: UsageMetrics):
+        """Compare token delta vs pct delta to derive the Anthropic cost multiplier for both windows."""
+        try:
+            prev_s_tok = self._prev_session_tokens
+            prev_s_pct = self._prev_session_pct
+            prev_w_tok = self._prev_weekly_tokens
+            prev_w_pct = self._prev_weekly_pct
+
+            self._prev_session_tokens = m.session_tokens
+            self._prev_session_pct    = m.session_pct
+            self._prev_weekly_tokens  = m.weekly_tokens
+            self._prev_weekly_pct     = m.weekly_pct
+
+            if any(v is None for v in (prev_s_tok, prev_s_pct, prev_w_tok, prev_w_pct)):
+                return
+
+            tokens_delta   = m.session_tokens - prev_s_tok
+            s_pct_delta    = m.session_pct    - prev_s_pct
+            w_pct_delta    = m.weekly_pct     - prev_w_pct
+
+            # Need a meaningful token increase and both pct values moving up
+            if tokens_delta < 100 or s_pct_delta <= 0 or w_pct_delta <= 0:
+                return
+
+            def _multiplier(pct_delta: float, limit: int) -> Optional[float]:
+                if limit <= 0:
+                    return None
+                expected = (tokens_delta / limit) * 100
+                if expected <= 0:
+                    return None
+                m = pct_delta / expected
+                return m if 0.1 <= m <= 50.0 else None
+
+            s_mult = _multiplier(s_pct_delta, m.session_limit)
+            w_mult = _multiplier(w_pct_delta, m.weekly_limit)
+
+            if s_mult is None or w_mult is None:
+                return
+
+            model = ""
+            if m.active_session and m.active_session.entries:
+                model = m.active_session.entries[-1].model or ""
+
+            self.db.save_multiplier(
+                session_tokens=m.session_tokens,
+                tokens_delta=tokens_delta,
+                session_pct=m.session_pct,
+                session_pct_delta=s_pct_delta,
+                session_multiplier=s_mult,
+                weekly_tokens=m.weekly_tokens,
+                weekly_pct=m.weekly_pct,
+                weekly_pct_delta=w_pct_delta,
+                weekly_multiplier=w_mult,
+                model=model,
+            )
+            logger.info(
+                "Multiplier logged — 5hr: %.2fx  weekly: %.2fx  model: %s  (tokens_delta=%d)",
+                s_mult, w_mult, model or "unknown", tokens_delta,
+            )
+        except Exception as e:
+            logger.error("multiplier log failed: %s", e)
 
     # ── Alerts ────────────────────────────────────────────────────────────────
     def _check_alerts(self, m: UsageMetrics):
@@ -432,6 +550,8 @@ class ClaudeUsageWidget:
         win.resizable(False, False)
         bg, fg, font = self._t("bg"), self._t("fg"), ("Segoe UI", 9)
 
+        org_id, session_key = load_session()
+
         fields = [
             ("Plan (pro / max5 / max20 / custom):", "plan"),
             ("Refresh interval (seconds):",          "refresh_interval_seconds"),
@@ -451,6 +571,27 @@ class ClaudeUsageWidget:
                      font=font, insertbackground=fg, width=24) \
                 .grid(row=r, column=1, padx=6, pady=3)
             vars_[key] = v
+
+        # Live API credentials
+        tk.Frame(frm, bg=self._t("border"), height=1).grid(
+            row=len(fields), column=0, columnspan=2, sticky="ew", padx=6, pady=6)
+        tk.Label(frm, text="── Live API (claude.ai) ──",
+                 bg=bg, fg=self._t("dim_fg"), font=("Segoe UI", 8)).grid(
+            row=len(fields)+1, column=0, columnspan=2, pady=(0,4))
+        for i, (label, val) in enumerate([
+            ("Organisation ID:", org_id or ""),
+            ("Session Key:",     session_key or ""),
+        ]):
+            tk.Label(frm, text=label, bg=bg, fg=fg, font=font, anchor="w").grid(
+                row=len(fields)+2+i, column=0, sticky="w", padx=6, pady=3)
+        org_var = tk.StringVar(value=org_id or "")
+        ses_var = tk.StringVar(value=session_key or "")
+        tk.Entry(frm, textvariable=org_var, bg=self._t("border"), fg=fg,
+                 font=font, insertbackground=fg, width=24).grid(
+            row=len(fields)+2, column=1, padx=6, pady=3)
+        tk.Entry(frm, textvariable=ses_var, bg=self._t("border"), fg=fg,
+                 font=font, insertbackground=fg, width=24, show="*").grid(
+            row=len(fields)+3, column=1, padx=6, pady=3)
 
         aot_var = tk.BooleanVar(value=self.config.get("always_on_top", True))
         tk.Checkbutton(frm, text="Always on top", variable=aot_var,
@@ -484,15 +625,30 @@ class ClaudeUsageWidget:
                 save_config(self.config)
                 self.root.attributes("-alpha",   self.config["opacity"])
                 self.root.attributes("-topmost", self.config["always_on_top"])
+                oid = org_var.get().strip()
+                sk  = ses_var.get().strip()
+                if oid and sk:
+                    save_session(oid, sk)
             except Exception as e:
                 logger.error("Settings save error: %s", e)
             win.destroy()
 
+        def _make_shortcut():
+            create_desktop_shortcut()
+            self._notify("Shortcut created", "Claude Usage Monitor shortcut added to Desktop")
+
+        tk.Button(frm, text="Create Desktop Shortcut",
+                  bg=self._t("btn_bg"), fg=self._t("btn_fg"),
+                  font=font, relief="flat", cursor="hand2",
+                  command=_make_shortcut).grid(
+            row=len(fields)+2, column=0, columnspan=2,
+            sticky="ew", padx=6, pady=(8, 2))
+
         tk.Button(frm, text="Save & Close", bg=self._t("btn_bg"),
                   fg=self._t("btn_fg"), font=font, relief="flat", cursor="hand2",
                   command=_save).grid(
-            row=len(fields)+2, column=0, columnspan=2,
-            sticky="ew", padx=6, pady=8)
+            row=len(fields)+3, column=0, columnspan=2,
+            sticky="ew", padx=6, pady=(2, 8))
 
     # ── Export ────────────────────────────────────────────────────────────────
     def _export_csv(self):
@@ -559,6 +715,60 @@ class ClaudeUsageWidget:
         self.root.mainloop()
 
 
+# ── Desktop shortcut ─────────────────────────────────────────────────────────
+def create_desktop_shortcut():
+    """Create a .lnk on the user's Desktop via Windows Script Host (no extra deps)."""
+    import subprocess
+    import tempfile
+
+    script_path = Path(__file__).resolve()
+    python_exe  = Path(sys.executable)
+    # pythonw.exe suppresses the console window
+    pythonw_exe = python_exe.parent / "pythonw.exe"
+    if not pythonw_exe.exists():
+        pythonw_exe = python_exe
+
+    desktop = Path.home() / "Desktop"
+    if not desktop.exists():
+        # OneDrive-roamed desktop
+        desktop = Path(os.environ.get("USERPROFILE", Path.home())) / "OneDrive" / "Desktop"
+    if not desktop.exists():
+        desktop = Path.home()
+
+    lnk_path = desktop / "Claude Usage Monitor.lnk"
+
+    q = '"'
+    vbs = (
+        f'Set sh = CreateObject("WScript.Shell")\n'
+        f'Set lnk = sh.CreateShortcut("{lnk_path}")\n'
+        f'lnk.TargetPath = "{pythonw_exe}"\n'
+        f'lnk.Arguments = {q}{script_path}{q}\n'
+        f'lnk.WorkingDirectory = "{script_path.parent}"\n'
+        f'lnk.Description = "Claude Code Usage Monitor"\n'
+        f'lnk.Save\n'
+    )
+
+    with tempfile.NamedTemporaryFile(suffix=".vbs", mode="w",
+                                     delete=False, encoding="utf-8") as f:
+        f.write(vbs)
+        vbs_path = f.name
+
+    try:
+        result = subprocess.run(
+            ["cscript", "//NoLogo", vbs_path],
+            capture_output=True, text=True, timeout=15,
+        )
+        if result.returncode == 0:
+            print(f"Shortcut created: {lnk_path}")
+        else:
+            print(f"Failed to create shortcut: {result.stderr.strip()}")
+    finally:
+        try:
+            os.unlink(vbs_path)
+        except OSError:
+            pass
+
+
 # ── Auto-start (Windows registry) ────────────────────────────────────────────
 def set_autostart(enable: bool):
     try:
@@ -591,11 +801,14 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Claude Code Usage Monitor Widget")
     ap.add_argument("--autostart",    action="store_true", help="Enable Windows auto-start")
     ap.add_argument("--no-autostart", action="store_true", help="Disable Windows auto-start")
+    ap.add_argument("--shortcut",     action="store_true", help="Create desktop shortcut and exit")
     args = ap.parse_args()
 
     if args.autostart:
         set_autostart(True); sys.exit(0)
     if args.no_autostart:
         set_autostart(False); sys.exit(0)
+    if args.shortcut:
+        create_desktop_shortcut(); sys.exit(0)
 
     ClaudeUsageWidget().run()
