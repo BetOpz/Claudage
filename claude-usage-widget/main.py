@@ -16,7 +16,7 @@ from typing import Optional
 
 from usage_monitor import calculate_metrics, UsageMetrics, PLAN_SESSION_LIMITS
 from database import UsageDatabase
-from optimization import get_best_worst_times, get_current_slot_rank
+from optimization import get_best_worst_times, get_current_slot_rank, get_avoid_times
 from claude_api import get_live_usage, save_session, load_session
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -124,6 +124,7 @@ class ClaudeUsageWidget:
         self._prev_session_pct: Optional[float] = None
         self._prev_weekly_tokens: Optional[int] = None
         self._prev_weekly_pct: Optional[float] = None
+        self._last_multiplier: Optional[tuple] = None
         self._opt_visible = False
         self._collapsed = False
         self._drag_x = self._drag_y = 0
@@ -225,6 +226,9 @@ class ClaudeUsageWidget:
         self.lbl_burn = tk.Label(brow, text="-- tok/min", bg=bg,
                                  fg=self._t("fg"), font=("Consolas", 8))
         self.lbl_burn.pack(side=tk.LEFT, padx=4)
+        self.lbl_mult = tk.Label(brow, text="", bg=bg,
+                                 fg="#ff8c00", font=("Consolas", 8))
+        self.lbl_mult.pack(side=tk.LEFT)
 
         # ETA
         erow = tk.Frame(body, bg=bg); erow.pack(fill=tk.X)
@@ -278,6 +282,18 @@ class ClaudeUsageWidget:
                            fg=USAGE_COLORS["red"], font=("Consolas", 7), anchor="w")
             lbl.pack(fill=tk.X)
             self.lbl_worst.append(lbl)
+
+        tk.Frame(inner, bg=self._t("border"), height=1).pack(fill=tk.X, pady=4)
+
+        tk.Label(inner, text="Avoid (high multiplier ≥1.5x):",
+                 bg=bg, fg=self._t("dim_fg"),
+                 font=("Consolas", 7, "bold")).pack(anchor="w")
+        self.lbl_avoid = []
+        for i in range(5):
+            lbl = tk.Label(inner, text=f"  {i+1}. --", bg=bg,
+                           fg="#ff8c00", font=("Consolas", 7), anchor="w")
+            lbl.pack(fill=tk.X)
+            self.lbl_avoid.append(lbl)
 
         self.lbl_rank = tk.Label(inner, text="", bg=bg,
                                  fg=self._t("title_fg"),
@@ -364,11 +380,12 @@ class ClaudeUsageWidget:
                 e for e in m.active_session.entries
                 if e.timestamp >= cutoff
             ]
-            if recent_entries:
+            if len(recent_entries) >= 2:
                 window_tokens = sum(e.input_tokens + e.output_tokens for e in recent_entries)
                 oldest = min(e.timestamp for e in recent_entries)
-                window_min = max((now - oldest).total_seconds() / 60, 1.0)
-                m.burn_rate_per_min = window_tokens / window_min
+                window_min = (now - oldest).total_seconds() / 60
+                if window_min >= 2.0:
+                    m.burn_rate_per_min = window_tokens / window_min
 
         self.metrics = m
         self._refresh_display(m)
@@ -392,6 +409,12 @@ class ClaudeUsageWidget:
             self.lbl_burn.config(text=f"{m.burn_rate_per_min:,.0f} tok/min")
         else:
             self.lbl_burn.config(text="-- tok/min")
+        if self._last_multiplier is not None:
+            s_mult, w_mult = self._last_multiplier
+            color = "#ff8c00" if max(s_mult, w_mult) >= 1.5 else "#aaaaaa"
+            self.lbl_mult.config(text=f"(5h:{s_mult:.1f}x wk:{w_mult:.1f}x)", fg=color)
+        else:
+            self.lbl_mult.config(text="")
 
         if m.session_remaining_minutes is not None:
             mins = int(m.session_remaining_minutes)
@@ -461,6 +484,7 @@ class ClaudeUsageWidget:
             if m.active_session and m.active_session.entries:
                 model = m.active_session.entries[-1].model or ""
 
+            self._last_multiplier = (s_mult, w_mult)
             self.db.save_multiplier(
                 session_tokens=m.session_tokens,
                 tokens_delta=tokens_delta,
@@ -529,6 +553,15 @@ class ClaudeUsageWidget:
                 if i < len(worst):
                     s = worst[i]
                     lbl.config(text=f"  {i+1}. {s.label} ({s.burn_display})")
+                else:
+                    lbl.config(text=f"  {i+1}. (collecting data…)")
+
+            mult_stats = self.db.get_hourly_multiplier_stats()
+            avoid = get_avoid_times(mult_stats, threshold=1.5, top_n=5)
+            for i, lbl in enumerate(self.lbl_avoid):
+                if i < len(avoid):
+                    s = avoid[i]
+                    lbl.config(text=f"  {i+1}. {s.label} ({s.multiplier_display})")
                 else:
                     lbl.config(text=f"  {i+1}. (collecting data…)")
 

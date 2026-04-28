@@ -205,6 +205,35 @@ class UsageDatabase:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def get_hourly_multiplier_stats(self, days_back: int = 90) -> List[dict]:
+        """
+        Return average session multiplier grouped by (day_of_week, hour_of_day).
+        Only includes slots with at least 2 samples.
+        """
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    CAST(strftime('%w', logged_at) AS INTEGER)  AS day_of_week_sun,
+                    CAST(strftime('%H', logged_at) AS INTEGER)  AS hour_of_day,
+                    AVG(session_multiplier)                      AS avg_multiplier,
+                    COUNT(*)                                     AS sample_count
+                FROM multiplier_log
+                WHERE logged_at >= datetime('now', ? || ' days')
+                GROUP BY day_of_week_sun, hour_of_day
+                HAVING sample_count >= 2
+                ORDER BY avg_multiplier DESC
+                """,
+                (f"-{days_back}",),
+            ).fetchall()
+        # Convert Sunday-based weekday (0=Sun) to Monday-based (0=Mon)
+        result = []
+        for r in rows:
+            d = dict(r)
+            d["day_of_week"] = (d.pop("day_of_week_sun") - 1) % 7
+            result.append(d)
+        return result
+
     def get_recent_sessions(self, days_back: int = 30) -> List[dict]:
         """Return session records from the last N days, newest first."""
         with self._conn() as conn:

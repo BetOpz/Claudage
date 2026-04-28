@@ -59,6 +59,44 @@ def get_best_worst_times(
     return best, worst
 
 
+def get_avoid_times(
+    multiplier_stats: List[dict],
+    threshold: float = 1.5,
+    top_n: int = 5,
+) -> List["AvoidSlot"]:
+    """Return slots where the average burn multiplier exceeds the threshold, worst first."""
+    slots = [
+        AvoidSlot(
+            day_of_week=int(row["day_of_week"]),
+            hour_of_day=int(row["hour_of_day"]),
+            avg_multiplier=float(row["avg_multiplier"]),
+            sample_count=int(row["sample_count"]),
+        )
+        for row in multiplier_stats
+        if float(row["avg_multiplier"]) >= threshold
+    ]
+    slots.sort(key=lambda s: s.avg_multiplier, reverse=True)
+    return slots[:top_n]
+
+
+@dataclass
+class AvoidSlot:
+    day_of_week: int
+    hour_of_day: int
+    avg_multiplier: float
+    sample_count: int
+
+    @property
+    def label(self) -> str:
+        day = DAYS[self.day_of_week]
+        end_h = (self.hour_of_day + 1) % 24
+        return f"{day} {self.hour_of_day:02d}:00-{end_h:02d}:00"
+
+    @property
+    def multiplier_display(self) -> str:
+        return f"{self.avg_multiplier:.1f}x"
+
+
 def get_current_slot_rank(
     hourly_stats: List[dict],
     day_of_week: int,
