@@ -230,13 +230,37 @@ class ClaudeUsageWidget:
                                  fg="#ff8c00", font=("Consolas", 8))
         self.lbl_mult.pack(side=tk.LEFT)
 
-        # ETA
+        # ETA (5h session)
         erow = tk.Frame(body, bg=bg); erow.pack(fill=tk.X)
-        tk.Label(erow, text="ETA: ", bg=bg, fg=self._t("dim_fg"),
+        tk.Label(erow, text="5hr EXP: ", bg=bg, fg=self._t("dim_fg"),
                  font=("Consolas", 8)).pack(side=tk.LEFT)
         self.lbl_eta = tk.Label(erow, text="--", bg=bg,
                                 fg=self._t("fg"), font=("Consolas", 8))
         self.lbl_eta.pack(side=tk.LEFT)
+
+        # CRP (5h session)
+        crp5row = tk.Frame(body, bg=bg); crp5row.pack(fill=tk.X)
+        tk.Label(crp5row, text="5hr CRP: ", bg=bg, fg=self._t("dim_fg"),
+                 font=("Consolas", 8)).pack(side=tk.LEFT)
+        self.lbl_crp5 = tk.Label(crp5row, text="--", bg=bg,
+                                  fg=self._t("fg"), font=("Consolas", 8))
+        self.lbl_crp5.pack(side=tk.LEFT)
+
+        # ETA (week)
+        wrow = tk.Frame(body, bg=bg); wrow.pack(fill=tk.X)
+        tk.Label(wrow, text="Week EXP: ", bg=bg, fg=self._t("dim_fg"),
+                 font=("Consolas", 8)).pack(side=tk.LEFT)
+        self.lbl_week_eta = tk.Label(wrow, text="--", bg=bg,
+                                     fg=self._t("fg"), font=("Consolas", 8))
+        self.lbl_week_eta.pack(side=tk.LEFT)
+
+        # CRP (week)
+        crpwrow = tk.Frame(body, bg=bg); crpwrow.pack(fill=tk.X)
+        tk.Label(crpwrow, text="Week CRP: ", bg=bg, fg=self._t("dim_fg"),
+                 font=("Consolas", 8)).pack(side=tk.LEFT)
+        self.lbl_crpw = tk.Label(crpwrow, text="--", bg=bg,
+                                  fg=self._t("fg"), font=("Consolas", 8))
+        self.lbl_crpw.pack(side=tk.LEFT)
 
         # Status line
         self.lbl_status = tk.Label(body, text="Initialising...",
@@ -353,6 +377,7 @@ class ClaudeUsageWidget:
                 m.session_pct = live.session_pct
                 m.weekly_pct  = live.weekly_pct
                 m.current_session_end = live.session_resets_at
+                m.weekly_resets_at = live.weekly_resets_at
                 # Recalculate ETA from official reset time
                 if live.session_resets_at:
                     now = datetime.now(timezone.utc)
@@ -416,12 +441,69 @@ class ClaudeUsageWidget:
         else:
             self.lbl_mult.config(text="")
 
-        if m.session_remaining_minutes is not None:
+        if m.session_remaining_minutes is not None and m.current_session_end:
             mins = int(m.session_remaining_minutes)
             eta = f"{mins // 60}h {mins % 60}m" if mins >= 60 else f"{mins}m"
-            self.lbl_eta.config(text=f"Resets in {eta}")
+            local_end = m.current_session_end.astimezone().strftime("%a %d/%m @ %H:%M")
+            self.lbl_eta.config(text=f"{eta} ({local_end})")
+        elif m.session_remaining_minutes is not None:
+            mins = int(m.session_remaining_minutes)
+            eta = f"{mins // 60}h {mins % 60}m" if mins >= 60 else f"{mins}m"
+            self.lbl_eta.config(text=eta)
         else:
             self.lbl_eta.config(text="--")
+
+        weekly_resets_at = getattr(m, "weekly_resets_at", None)
+        if weekly_resets_at:
+            now = datetime.now(timezone.utc)
+            wmins = int(max(0, (weekly_resets_at - now).total_seconds()) // 60)
+            wdays = wmins // 1440
+            whrs = (wmins % 1440) // 60
+            wm = wmins % 60
+            weta = f"{wdays:02d}:{whrs:02d}:{wm:02d}"
+            wlocal = weekly_resets_at.astimezone().strftime("%a %d/%m @ %H:%M")
+            self.lbl_week_eta.config(text=f"{weta} ({wlocal})")
+        else:
+            self.lbl_week_eta.config(text="--")
+
+        # CRP — predict expiry based on average rate so far
+        now = datetime.now(timezone.utc)
+
+        # 5hr CRP: rate = session_pct% used over elapsed time within the 5hr window
+        # Window started at (session_reset_time - 5hrs)
+        if m.session_pct > 0 and m.current_session_end:
+            window_start = m.current_session_end - timedelta(hours=5)
+            elapsed_mins = (now - window_start).total_seconds() / 60
+            if elapsed_mins >= 1:
+                pct_per_min = m.session_pct / elapsed_mins
+                mins_to_full = (100 - m.session_pct) / pct_per_min
+                crp5_dt = now + timedelta(minutes=mins_to_full)
+                crp5_local = crp5_dt.astimezone().strftime("%a %d/%m @ %H:%M")
+                h, rem = divmod(int(mins_to_full), 60)
+                self.lbl_crp5.config(text=f"{h}h {rem}m ({crp5_local})")
+            else:
+                self.lbl_crp5.config(text="--")
+        else:
+            self.lbl_crp5.config(text="--")
+
+        # Week CRP: rate = weekly_pct% used over elapsed week time (week started 7d before reset)
+        weekly_resets_at2 = getattr(m, "weekly_resets_at", None)
+        if m.weekly_pct > 0 and weekly_resets_at2:
+            week_start = weekly_resets_at2 - timedelta(days=7)
+            elapsed_week_mins = (now - week_start).total_seconds() / 60
+            if elapsed_week_mins >= 1:
+                wpct_per_min = m.weekly_pct / elapsed_week_mins
+                wmins_to_full = (100 - m.weekly_pct) / wpct_per_min
+                crpw_dt = now + timedelta(minutes=wmins_to_full)
+                crpw_local = crpw_dt.astimezone().strftime("%a %d/%m @ %H:%M")
+                wd = int(wmins_to_full) // 1440
+                wh = (int(wmins_to_full) % 1440) // 60
+                wm2 = int(wmins_to_full) % 60
+                self.lbl_crpw.config(text=f"{wd:02d}:{wh:02d}:{wm2:02d} ({crpw_local})")
+            else:
+                self.lbl_crpw.config(text="--")
+        else:
+            self.lbl_crpw.config(text="--")
 
         if m.error:
             self.lbl_status.config(text=m.error, fg=self._t("error_fg"))

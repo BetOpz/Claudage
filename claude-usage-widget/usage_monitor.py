@@ -84,6 +84,7 @@ class UsageMetrics:
     weekly_remaining_minutes: Optional[float] = None
     current_session_start: Optional[datetime] = None
     current_session_end: Optional[datetime] = None
+    weekly_resets_at: Optional[datetime] = None
     active_session: Optional[SessionBlock] = None
     data_path: Optional[Path] = None
     error: Optional[str] = None
