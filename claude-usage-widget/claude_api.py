@@ -250,6 +250,16 @@ def load_session() -> tuple[Optional[str], Optional[str]]:
         return None, None
 
 
+@dataclass
+class LiveUsage:
+    session_pct: float
+    weekly_pct: float
+    session_resets_at: Optional[datetime]
+    weekly_resets_at: Optional[datetime]
+    extra_credits_pct: Optional[float]
+    error: Optional[str] = None
+
+
 def fetch_live_usage(org_id: str, session_key: str) -> LiveUsage:
     url = f"{CLAUDE_AI_BASE}/api/organizations/{org_id}/usage"
     req = urllib.request.Request(url)
@@ -290,16 +300,6 @@ def fetch_live_usage(org_id: str, session_key: str) -> LiveUsage:
     except Exception as e:
         logger.warning("claude.ai usage fetch failed: %s", e)
         return LiveUsage(0, 0, None, None, None, error=str(e))
-
-
-@dataclass
-class LiveUsage:
-    session_pct: float
-    weekly_pct: float
-    session_resets_at: Optional[datetime]
-    weekly_resets_at: Optional[datetime]
-    extra_credits_pct: Optional[float]
-    error: Optional[str] = None
 
 
 def get_live_usage() -> Optional[LiveUsage]:
